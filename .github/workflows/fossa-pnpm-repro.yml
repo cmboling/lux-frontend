@@ -1,0 +1,395 @@
+name: FOSSA pnpm multi-document repro
+
+# Reproduces: "Error: parsing file: .../pnpm-lock.yaml  Multiple YAML documents encountered"
+#
+# Hypothesis under test: the failure is NOT OS-specific. client/pnpm-lock.yaml and
+# server/pnpm-lock.yaml each contain TWO YAML documents (pnpm 11 writes a leading
+# `packageManagerDependencies` document when devEngines.packageManager is set), and
+# fossa-cli's YAML parser only accepts single-document streams. If that is right,
+# EVERY runner below fails identically -- including macOS.
+#
+# Each job uploads fossa.debug.json.gz plus logs as an artifact.
+
+on:
+  workflow_dispatch:
+    inputs:
+      fossa_version:
+        description: "fossa-cli version to install (no leading v)"
+        required: true
+        default: "3.17.16"
+      scan_dir:
+        description: "Directory to run `fossa analyze` in"
+        required: true
+        default: "."
+  push:
+    paths:
+      - ".github/workflows/fossa-pnpm-repro.yml"
+
+env:
+  FOSSA_VERSION: ${{ github.event.inputs.fossa_version || '3.17.16' }}
+  SCAN_DIR: ${{ github.event.inputs.scan_dir || '.' }}
+  # Providing the secret is optional. Without it we fall back to `--output`,
+  # which analyzes locally and skips the upload to app.fossa.com.
+  FOSSA_API_KEY: ${{ secrets.FOSSA_API_KEY }}
+  NO_COLOR: "1"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Every GitHub-hosted runner class.
+  # ---------------------------------------------------------------------------
+  hosted:
+    name: ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-latest
+          - ubuntu-24.04
+          - ubuntu-22.04
+          - ubuntu-24.04-arm
+          - ubuntu-22.04-arm
+          - macos-latest
+          - macos-15
+          - macos-14
+          - macos-13
+          - windows-latest
+          - windows-2025
+          - windows-2022
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fingerprint the lockfiles
+        shell: bash
+        run: |
+          set -eu
+          mkdir -p _repro
+          {
+            echo "runner_label : ${{ matrix.runner }}"
+            echo "runner_os    : ${{ runner.os }}"
+            echo "runner_arch  : ${{ runner.arch }}"
+            echo "uname        : $(uname -a)"
+            echo "commit       : $(git rev-parse HEAD)"
+            echo
+            for f in client/pnpm-lock.yaml server/pnpm-lock.yaml; do
+              [ -f "$f" ] || { echo "$f : MISSING"; continue; }
+              echo "$f"
+              echo "  yaml documents : $(grep -c '^---' "$f" || true)   (>1 means fossa cannot parse it)"
+              echo "  git blob sha   : $(git hash-object "$f")"
+              echo "  bytes          : $(wc -c < "$f" | tr -d ' ')"
+              echo "  lockfileVersion: $(grep -m1 'lockfileVersion' "$f" || true)"
+              echo "  doc separators : lines $(grep -n '^---' "$f" | cut -d: -f1 | tr '\n' ' ')"
+              echo
+            done
+          } | tee _repro/lockfile-fingerprint.txt
+
+      - name: Install fossa-cli (Linux / macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$(uname -s)" in
+            Linux)  OS=linux ;;
+            Darwin) OS=darwin ;;
+            *) echo "unexpected OS"; exit 1 ;;
+          esac
+          case "$(uname -m)" in
+            x86_64|amd64)  ARCH=amd64 ;;
+            arm64|aarch64) ARCH=arm64 ;;
+            *) echo "unexpected arch: $(uname -m)"; exit 1 ;;
+          esac
+          URL="https://github.com/fossas/fossa-cli/releases/download/v${FOSSA_VERSION}/fossa_${FOSSA_VERSION}_${OS}_${ARCH}.zip"
+          echo "downloading $URL"
+          curl -fsSL -o /tmp/fossa.zip "$URL"
+          mkdir -p "$HOME/fossa-bin"
+          unzip -o -q /tmp/fossa.zip -d "$HOME/fossa-bin"
+          chmod +x "$HOME/fossa-bin/fossa"
+          echo "$HOME/fossa-bin" >> "$GITHUB_PATH"
+
+      - name: Install fossa-cli (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ProgressPreference = "SilentlyContinue"
+          # Only windows_amd64 is published; there is no windows_arm64 asset.
+          $url = "https://github.com/fossas/fossa-cli/releases/download/v$env:FOSSA_VERSION/fossa_${env:FOSSA_VERSION}_windows_amd64.zip"
+          Write-Host "downloading $url"
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\fossa.zip"
+          $dest = "$env:USERPROFILE\fossa-bin"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Expand-Archive -Path "$env:RUNNER_TEMP\fossa.zip" -DestinationPath $dest -Force
+          $dest | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: fossa --version
+        shell: bash
+        run: fossa --version 2>&1 | tee _repro/fossa-version.txt
+
+      - name: fossa list-targets
+        shell: bash
+        continue-on-error: true
+        working-directory: ${{ github.event.inputs.scan_dir || '.' }}
+        run: |
+          set +e
+          fossa list-targets 2>&1 | tee "$GITHUB_WORKSPACE/_repro/fossa-list-targets.log"
+          exit 0
+
+      - name: fossa analyze --debug
+        id: analyze
+        shell: bash
+        working-directory: ${{ github.event.inputs.scan_dir || '.' }}
+        run: |
+          set +e
+          if [ -n "${FOSSA_API_KEY:-}" ]; then
+            echo "FOSSA_API_KEY present -> running a normal (uploading) analyze"
+            ARGS="--debug"
+          else
+            echo "no FOSSA_API_KEY -> running with --output (local analysis, no upload)"
+            ARGS="--debug --output"
+          fi
+
+          fossa analyze $ARGS 2>&1 | tee "$GITHUB_WORKSPACE/_repro/fossa-analyze.log"
+          EXIT=${PIPESTATUS[0]}
+          echo "exit_code=$EXIT" >> "$GITHUB_OUTPUT"
+          echo "fossa analyze exited with $EXIT"
+
+          # Strip ANSI and collapse newlines so a wrapped error message still matches.
+          NORM="$(sed -e 's/\x1b\[[0-9;]*m//g' "$GITHUB_WORKSPACE/_repro/fossa-analyze.log" | tr -s ' \n\r' ' ')"
+          if printf '%s' "$NORM" | grep -q "Multiple YAML documents"; then
+            echo "repro=YES" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Reproduced on ${{ matrix.runner }}::Multiple YAML documents encountered"
+          else
+            echo "repro=no" >> "$GITHUB_OUTPUT"
+          fi
+          exit 0
+
+      - name: Collect debug bundle
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          mkdir -p _repro
+          # fossa writes fossa.debug.json.gz into the directory analyze ran in.
+          find . -name 'fossa.debug.json.gz' -not -path './_repro/*' -print -exec cp {} _repro/ \;
+          if [ ! -f _repro/fossa.debug.json.gz ]; then
+            echo "NOTE: no fossa.debug.json.gz was produced" | tee _repro/NO-DEBUG-BUNDLE.txt
+          fi
+          ls -la _repro
+          exit 0
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fossa-debug-${{ matrix.runner }}
+          path: _repro/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Job summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### ${{ matrix.runner }}"
+            echo
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| arch | ${{ runner.arch }} |"
+            echo "| fossa | $(cat _repro/fossa-version.txt 2>/dev/null | head -1) |"
+            echo "| analyze exit code | \`${{ steps.analyze.outputs.exit_code }}\` |"
+            echo "| reproduced parse error | **${{ steps.analyze.outputs.repro }}** |"
+            echo "| client doc count | $(grep -c '^---' client/pnpm-lock.yaml 2>/dev/null || echo n/a) |"
+            echo "| server doc count | $(grep -c '^---' server/pnpm-lock.yaml 2>/dev/null || echo n/a) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Closest match to the customer's self-hosted runner (Amazon Linux 2023).
+  # GitHub does not offer an AL2023 hosted runner, so run it as a container.
+  # ---------------------------------------------------------------------------
+  amazonlinux-2023:
+    name: amazonlinux-2023 (container)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    container:
+      image: amazonlinux:2023
+
+    steps:
+      - name: Install container prerequisites
+        run: dnf install -y git tar gzip unzip findutils shadow-utils
+
+      - uses: actions/checkout@v4
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Fingerprint the lockfiles
+        shell: bash
+        run: |
+          set -eu
+          mkdir -p _repro
+          {
+            echo "runner       : amazonlinux:2023 container on ubuntu-latest"
+            echo "os-release   : $(grep PRETTY_NAME /etc/os-release)"
+            echo "uname        : $(uname -a)"
+            echo "commit       : $(git rev-parse HEAD)"
+            echo
+            for f in client/pnpm-lock.yaml server/pnpm-lock.yaml; do
+              [ -f "$f" ] || { echo "$f : MISSING"; continue; }
+              echo "$f"
+              echo "  yaml documents : $(grep -c '^---' "$f" || true)"
+              echo "  git blob sha   : $(git hash-object "$f")"
+              echo "  doc separators : lines $(grep -n '^---' "$f" | cut -d: -f1 | tr '\n' ' ')"
+              echo
+            done
+          } | tee _repro/lockfile-fingerprint.txt
+
+      - name: Install fossa-cli
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARCH=amd64
+          [ "$(uname -m)" = "aarch64" ] && ARCH=arm64
+          URL="https://github.com/fossas/fossa-cli/releases/download/v${FOSSA_VERSION}/fossa_${FOSSA_VERSION}_linux_${ARCH}.zip"
+          curl -fsSL -o /tmp/fossa.zip "$URL"
+          mkdir -p /usr/local/bin
+          unzip -o -q /tmp/fossa.zip -d /usr/local/bin
+          chmod +x /usr/local/bin/fossa
+          fossa --version | tee _repro/fossa-version.txt
+
+      - name: fossa list-targets
+        continue-on-error: true
+        shell: bash
+        working-directory: ${{ github.event.inputs.scan_dir || '.' }}
+        run: fossa list-targets 2>&1 | tee "$GITHUB_WORKSPACE/_repro/fossa-list-targets.log"; exit 0
+
+      - name: fossa analyze --debug
+        id: analyze
+        shell: bash
+        working-directory: ${{ github.event.inputs.scan_dir || '.' }}
+        run: |
+          set +e
+          if [ -n "${FOSSA_API_KEY:-}" ]; then ARGS="--debug"; else ARGS="--debug --output"; fi
+          fossa analyze $ARGS 2>&1 | tee "$GITHUB_WORKSPACE/_repro/fossa-analyze.log"
+          EXIT=${PIPESTATUS[0]}
+          echo "exit_code=$EXIT" >> "$GITHUB_OUTPUT"
+          NORM="$(sed -e 's/\x1b\[[0-9;]*m//g' "$GITHUB_WORKSPACE/_repro/fossa-analyze.log" | tr -s ' \n\r' ' ')"
+          if printf '%s' "$NORM" | grep -q "Multiple YAML documents"; then
+            echo "repro=YES" >> "$GITHUB_OUTPUT"
+          else
+            echo "repro=no" >> "$GITHUB_OUTPUT"
+          fi
+          exit 0
+
+      - name: Collect debug bundle
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          find . -name 'fossa.debug.json.gz' -not -path './_repro/*' -print -exec cp {} _repro/ \;
+          ls -la _repro
+          exit 0
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fossa-debug-amazonlinux-2023
+          path: _repro/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Job summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### amazonlinux-2023 (container)"
+            echo
+            echo "| analyze exit code | reproduced |"
+            echo "| --- | --- |"
+            echo "| \`${{ steps.analyze.outputs.exit_code }}\` | **${{ steps.analyze.outputs.repro }}** |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Control: strip the leading packageManagerDependencies document, then analyze.
+  # If this job passes while the others fail, the workaround is proven.
+  # ---------------------------------------------------------------------------
+  workaround-check:
+    name: workaround (strip doc 1)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install fossa-cli
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="https://github.com/fossas/fossa-cli/releases/download/v${FOSSA_VERSION}/fossa_${FOSSA_VERSION}_linux_amd64.zip"
+          curl -fsSL -o /tmp/fossa.zip "$URL"
+          mkdir -p "$HOME/fossa-bin"
+          unzip -o -q /tmp/fossa.zip -d "$HOME/fossa-bin"
+          chmod +x "$HOME/fossa-bin/fossa"
+          echo "$HOME/fossa-bin" >> "$GITHUB_PATH"
+
+      - name: Strip the pnpm package-manager document
+        shell: bash
+        run: |
+          set -eu
+          mkdir -p _repro
+          for f in client/pnpm-lock.yaml server/pnpm-lock.yaml; do
+            [ -f "$f" ] || continue
+            before=$(grep -c '^---' "$f" || true)
+            # Keep everything from the SECOND `---` onward, i.e. drop document 1.
+            awk '/^---$/{n++} n>=2' "$f" > "$f.stripped"
+            mv "$f.stripped" "$f"
+            after=$(grep -c '^---' "$f" || true)
+            echo "$f: documents $before -> $after" | tee -a _repro/strip-report.txt
+          done
+
+      - name: fossa analyze --debug (after strip)
+        id: analyze
+        shell: bash
+        working-directory: ${{ github.event.inputs.scan_dir || '.' }}
+        run: |
+          set +e
+          if [ -n "${FOSSA_API_KEY:-}" ]; then ARGS="--debug"; else ARGS="--debug --output"; fi
+          fossa analyze $ARGS 2>&1 | tee "$GITHUB_WORKSPACE/_repro/fossa-analyze.log"
+          EXIT=${PIPESTATUS[0]}
+          echo "exit_code=$EXIT" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Collect debug bundle
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          find . -name 'fossa.debug.json.gz' -not -path './_repro/*' -print -exec cp {} _repro/ \;
+          exit 0
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fossa-debug-workaround-stripped
+          path: _repro/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Job summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### workaround (strip doc 1)"
+            echo
+            echo "analyze exit code: \`${{ steps.analyze.outputs.exit_code }}\`  (0 = workaround confirmed)"
+            echo
+            echo '```'
+            cat _repro/strip-report.txt 2>/dev/null
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
